@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 
 use libp2p::multiaddr::Protocol;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
 use libp2p::{
+    autonat::v2,
     identify::{self, Event as IdentifyEvent},
     identity,
     kad::{
@@ -21,9 +22,10 @@ use libp2p::{
     mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
     ping::{self, Behaviour as Ping, Event as PingEvent},
     request_response as rr,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{behaviour::toggle, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use rand::rngs::OsRng;
 const EXPECTED_PROTOCOL_VERSION: &str = "/chiral/1.0.0";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +45,51 @@ pub struct FileMetadata {
     pub key_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NatReachabilityState {
+    Unknown,
+    Public,
+    Private,
+}
+
+impl Default for NatReachabilityState {
+    fn default() -> Self {
+        NatReachabilityState::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NatConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for NatConfidence {
+    fn default() -> Self {
+        NatConfidence::Low
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NatHistoryItem {
+    pub state: NatReachabilityState,
+    pub confidence: NatConfidence,
+    pub timestamp: u64,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReachabilityRecord {
+    state: NatReachabilityState,
+    confidence: NatConfidence,
+    timestamp: SystemTime,
+    summary: Option<String>,
+}
+
 #[derive(NetworkBehaviour)]
 struct DhtBehaviour {
     kademlia: Kademlia<MemoryStore>,
@@ -50,6 +97,8 @@ struct DhtBehaviour {
     mdns: Mdns,
     ping: ping::Behaviour,
     proxy_rr: rr::Behaviour<ProxyCodec>,
+    autonat_client: toggle::Toggle<v2::client::Behaviour>,
+    autonat_server: toggle::Toggle<v2::server::Behaviour>,
 }
 
 #[derive(Debug)]
@@ -91,6 +140,12 @@ pub enum DhtEvent {
         utf8: Option<String>,
         bytes: usize,
     },
+    NatStatus {
+        state: NatReachabilityState,
+        confidence: NatConfidence,
+        last_error: Option<String>,
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +168,16 @@ struct DhtMetrics {
     last_error: Option<String>,
     bootstrap_failures: u64,
     listen_addrs: Vec<String>,
+    reachability_state: NatReachabilityState,
+    reachability_confidence: NatConfidence,
+    last_reachability_change: Option<SystemTime>,
+    last_probe_at: Option<SystemTime>,
+    last_reachability_error: Option<String>,
+    observed_addrs: Vec<String>,
+    reachability_history: VecDeque<ReachabilityRecord>,
+    success_streak: u32,
+    failure_streak: u32,
+    autonat_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +190,14 @@ pub struct DhtMetricsSnapshot {
     pub last_error_at: Option<u64>,
     pub bootstrap_failures: u64,
     pub listen_addrs: Vec<String>,
+    pub reachability: NatReachabilityState,
+    pub reachability_confidence: NatConfidence,
+    pub last_reachability_change: Option<u64>,
+    pub last_probe_at: Option<u64>,
+    pub last_reachability_error: Option<String>,
+    pub observed_addrs: Vec<String>,
+    pub reachability_history: Vec<NatHistoryItem>,
+    pub autonat_enabled: bool,
 }
 
 // ------Proxy Protocol Implementation------
@@ -211,14 +284,55 @@ impl DhtMetricsSnapshot {
             ts.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
         }
 
+        let DhtMetrics {
+            last_bootstrap,
+            last_success,
+            last_error_at,
+            last_error,
+            bootstrap_failures,
+            listen_addrs,
+            reachability_state,
+            reachability_confidence,
+            last_reachability_change,
+            last_probe_at,
+            last_reachability_error,
+            observed_addrs,
+            reachability_history,
+            autonat_enabled,
+            ..
+        } = metrics;
+
+        let history: Vec<NatHistoryItem> = reachability_history
+            .into_iter()
+            .map(|record| NatHistoryItem {
+                state: record.state,
+                confidence: record.confidence,
+                timestamp: record
+                    .timestamp
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+                summary: record.summary,
+            })
+            .collect();
+
         DhtMetricsSnapshot {
             peer_count,
-            last_bootstrap: metrics.last_bootstrap.and_then(to_secs),
-            last_peer_event: metrics.last_success.and_then(to_secs),
-            last_error: metrics.last_error,
-            last_error_at: metrics.last_error_at.and_then(to_secs),
-            bootstrap_failures: metrics.bootstrap_failures,
-            listen_addrs: metrics.listen_addrs,
+            last_bootstrap: last_bootstrap.and_then(to_secs),
+            last_peer_event: last_success.and_then(to_secs),
+            last_error,
+            last_error_at: last_error_at.and_then(to_secs),
+            bootstrap_failures,
+            listen_addrs,
+            reachability: reachability_state,
+            reachability_confidence,
+            last_reachability_change: last_reachability_change.and_then(to_secs),
+            last_probe_at: last_probe_at.and_then(to_secs),
+            last_reachability_error,
+            observed_addrs,
+            reachability_history: history,
+            autonat_enabled,
         }
     }
 }
@@ -233,6 +347,89 @@ impl DhtMetrics {
         {
             self.listen_addrs.push(addr_str);
         }
+    }
+
+    fn record_observed_addr(&mut self, addr: &Multiaddr) {
+        let addr_str = addr.to_string();
+        if self
+            .observed_addrs
+            .iter()
+            .any(|existing| existing == &addr_str)
+        {
+            return;
+        }
+        self.observed_addrs.push(addr_str);
+        if self.observed_addrs.len() > 8 {
+            self.observed_addrs.remove(0);
+        }
+    }
+
+    fn remove_observed_addr(&mut self, addr: &Multiaddr) {
+        let addr_str = addr.to_string();
+        self.observed_addrs.retain(|existing| existing != &addr_str);
+    }
+
+    fn confidence_from_streak(&self, streak: u32) -> NatConfidence {
+        match streak {
+            0 | 1 => NatConfidence::Low,
+            2 | 3 => NatConfidence::Medium,
+            _ => NatConfidence::High,
+        }
+    }
+
+    fn push_history(&mut self, record: ReachabilityRecord) {
+        self.reachability_history.push_front(record);
+        if self.reachability_history.len() > 10 {
+            self.reachability_history.pop_back();
+        }
+    }
+
+    fn update_reachability(&mut self, state: NatReachabilityState, summary: Option<String>) {
+        let now = SystemTime::now();
+        self.last_probe_at = Some(now);
+
+        match state {
+            NatReachabilityState::Public => {
+                self.success_streak = self.success_streak.saturating_add(1);
+                self.failure_streak = 0;
+                self.last_reachability_error = None;
+                self.reachability_confidence = self.confidence_from_streak(self.success_streak);
+            }
+            NatReachabilityState::Private => {
+                self.failure_streak = self.failure_streak.saturating_add(1);
+                self.success_streak = 0;
+                if let Some(ref s) = summary {
+                    self.last_reachability_error = Some(s.clone());
+                }
+                self.reachability_confidence = self.confidence_from_streak(self.failure_streak);
+            }
+            NatReachabilityState::Unknown => {
+                self.success_streak = 0;
+                self.failure_streak = 0;
+                self.reachability_confidence = NatConfidence::Low;
+                self.last_reachability_error = summary.clone();
+            }
+        }
+
+        let state_changed = self.reachability_state != state;
+        self.reachability_state = state;
+
+        if state_changed {
+            self.last_reachability_change = Some(now);
+        }
+
+        if state_changed || summary.is_some() {
+            self.push_history(ReachabilityRecord {
+                state,
+                confidence: self.reachability_confidence,
+                timestamp: now,
+                summary,
+            });
+        }
+    }
+
+    fn note_probe_failure(&mut self, error: String) {
+        self.last_reachability_error = Some(error);
     }
 }
 
@@ -424,6 +621,18 @@ async fn run_dht_node(
                                 // let _ = event_tx.send(DhtEvent::Error(format!("Ping error {}: {}", peer, e))).await;
                             }
                         }
+                    }
+                    SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatClient(ev)) => {
+                        handle_autonat_client_event(ev, &metrics, &event_tx).await;
+                    }
+                    SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatServer(ev)) => {
+                        debug!(?ev, "AutoNAT server event");
+                    }
+                    SwarmEvent::ExternalAddrConfirmed { address, .. } => {
+                        handle_external_addr_confirmed(&address, &metrics, &event_tx).await;
+                    }
+                    SwarmEvent::ExternalAddrExpired { address, .. } => {
+                        handle_external_addr_expired(&address, &metrics, &event_tx).await;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         info!("✅ CONNECTION ESTABLISHED with peer: {}", peer_id);
@@ -765,6 +974,143 @@ async fn handle_ping_event(event: PingEvent) {
     }
 }
 
+async fn handle_autonat_client_event(
+    event: v2::client::Event,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let v2::client::Event {
+        tested_addr,
+        server,
+        bytes_sent,
+        result,
+    } = event;
+
+    let mut metrics_guard = metrics.lock().await;
+    if !metrics_guard.autonat_enabled {
+        return;
+    }
+
+    let addr_str = tested_addr.to_string();
+    let server_str = server.to_string();
+    let (state, summary) = match result {
+        Ok(()) => {
+            metrics_guard.record_observed_addr(&tested_addr);
+            info!(
+                server = %server_str,
+                address = %addr_str,
+                bytes = bytes_sent,
+                "AutoNAT probe succeeded"
+            );
+            (
+                NatReachabilityState::Public,
+                Some(format!(
+                    "Confirmed reachability via {addr_str} (server {server_str})"
+                )),
+            )
+        }
+        Err(err) => {
+            let err_msg = err.to_string();
+            warn!(
+                server = %server_str,
+                address = %addr_str,
+                error = %err_msg,
+                bytes = bytes_sent,
+                "AutoNAT probe failed"
+            );
+            (
+                NatReachabilityState::Private,
+                Some(format!(
+                    "Probe via {addr_str} (server {server_str}) failed: {err_msg}"
+                )),
+            )
+        }
+    };
+
+    metrics_guard.update_reachability(state, summary.clone());
+    let nat_state = metrics_guard.reachability_state;
+    let confidence = metrics_guard.reachability_confidence;
+    let last_error = metrics_guard.last_reachability_error.clone();
+    drop(metrics_guard);
+
+    let _ = event_tx
+        .send(DhtEvent::NatStatus {
+            state: nat_state,
+            confidence,
+            last_error,
+            summary,
+        })
+        .await;
+}
+
+async fn handle_external_addr_confirmed(
+    addr: &Multiaddr,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let mut metrics_guard = metrics.lock().await;
+    let nat_enabled = metrics_guard.autonat_enabled;
+    metrics_guard.record_observed_addr(addr);
+    if metrics_guard.reachability_state == NatReachabilityState::Public {
+        drop(metrics_guard);
+        return;
+    }
+    let summary = Some(format!("External address confirmed: {}", addr));
+    metrics_guard.update_reachability(NatReachabilityState::Public, summary.clone());
+    let state = metrics_guard.reachability_state;
+    let confidence = metrics_guard.reachability_confidence;
+    let last_error = metrics_guard.last_reachability_error.clone();
+    drop(metrics_guard);
+
+    if !nat_enabled {
+        return;
+    }
+
+    let _ = event_tx
+        .send(DhtEvent::NatStatus {
+            state,
+            confidence,
+            last_error,
+            summary,
+        })
+        .await;
+}
+
+async fn handle_external_addr_expired(
+    addr: &Multiaddr,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let summary_text = format!("External address expired: {}", addr);
+    let mut metrics_guard = metrics.lock().await;
+    let nat_enabled = metrics_guard.autonat_enabled;
+    metrics_guard.remove_observed_addr(addr);
+
+    if metrics_guard.observed_addrs.is_empty()
+        && metrics_guard.reachability_state != NatReachabilityState::Unknown
+    {
+        let summary = Some(summary_text);
+        metrics_guard.update_reachability(NatReachabilityState::Unknown, summary.clone());
+        let state = metrics_guard.reachability_state;
+        let confidence = metrics_guard.reachability_confidence;
+        let last_error = metrics_guard.last_reachability_error.clone();
+        drop(metrics_guard);
+
+        if !nat_enabled {
+            return;
+        }
+
+        let _ = event_tx
+            .send(DhtEvent::NatStatus {
+                state,
+                confidence,
+                last_error,
+                summary,
+            })
+            .await;
+    }
+}
+
 impl DhtService {
     pub async fn echo(&self, peer_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         let peer: PeerId = peer_id
@@ -800,6 +1146,9 @@ impl DhtService {
         bootstrap_nodes: Vec<String>,
         secret: Option<String>,
         is_bootstrap: bool,
+        enable_autonat: bool,
+        autonat_probe_interval: Option<Duration>,
+        autonat_servers: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Generate a new keypair for this node
         // Generate a keypair either from the secret or randomly
@@ -861,13 +1210,46 @@ impl DhtService {
             std::iter::once(("/chiral/proxy/1.0.0".to_string(), rr::ProtocolSupport::Full));
         let proxy_rr = rr::Behaviour::new(protocols, rr_cfg);
 
+        let probe_interval = autonat_probe_interval.unwrap_or(Duration::from_secs(30));
+        let autonat_client_behaviour = if enable_autonat {
+            info!(
+                "AutoNAT enabled (probe interval: {}s)",
+                probe_interval.as_secs()
+            );
+            Some(v2::client::Behaviour::new(
+                OsRng,
+                v2::client::Config::default().with_probe_interval(probe_interval),
+            ))
+        } else {
+            info!("AutoNAT disabled");
+            None
+        };
+        let autonat_server_behaviour = if enable_autonat {
+            Some(v2::server::Behaviour::new(OsRng))
+        } else {
+            None
+        };
+
         let behaviour = DhtBehaviour {
             kademlia,
             identify,
             mdns,
             ping: Ping::new(ping::Config::new()),
             proxy_rr,
+            autonat_client: toggle::Toggle::from(autonat_client_behaviour),
+            autonat_server: toggle::Toggle::from(autonat_server_behaviour),
         };
+
+        let bootstrap_set: HashSet<String> = bootstrap_nodes.iter().cloned().collect();
+        let mut autonat_targets: HashSet<String> = if enable_autonat && !autonat_servers.is_empty()
+        {
+            autonat_servers.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        if enable_autonat {
+            autonat_targets.extend(bootstrap_set.iter().cloned());
+        }
 
         // Create the swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -920,6 +1302,25 @@ impl DhtService {
             }
         }
 
+        if enable_autonat {
+            for server_addr in &autonat_targets {
+                if bootstrap_set.contains(server_addr) {
+                    continue;
+                }
+                match server_addr.parse::<Multiaddr>() {
+                    Ok(addr) => match swarm.dial(addr.clone()) {
+                        Ok(_) => {
+                            info!("Dialing AutoNAT server: {}", server_addr);
+                        }
+                        Err(e) => {
+                            debug!("Failed to dial AutoNAT server {}: {}", server_addr, e);
+                        }
+                    },
+                    Err(e) => warn!("Invalid AutoNAT server address {}: {}", server_addr, e),
+                }
+            }
+        }
+
         // Trigger initial bootstrap if we have any bootstrap nodes (even if connection failed)
         if !bootstrap_nodes.is_empty() {
             let _ = swarm.behaviour_mut().kademlia.bootstrap();
@@ -946,6 +1347,11 @@ impl DhtService {
         let search_counter = Arc::new(AtomicU64::new(1));
         let proxy_targets = Arc::new(Mutex::new(HashSet::new()));
         let proxy_capable = Arc::new(Mutex::new(HashSet::new()));
+
+        {
+            let mut guard = metrics.lock().await;
+            guard.autonat_enabled = enable_autonat;
+        }
 
         // Spawn the DHT node task
         tokio::spawn(run_dht_node(
@@ -1143,20 +1549,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_command_stops_dht_service() {
-        let service = match DhtService::new(0, Vec::new(), None, false).await {
-            Ok(service) => service,
-            Err(err) => {
-                let message = err.to_string();
-                let lowered = message.to_ascii_lowercase();
-                if lowered.contains("permission denied") || lowered.contains("not permitted") {
-                    eprintln!(
+        let service =
+            match DhtService::new(0, Vec::new(), None, false, false, None, Vec::new()).await {
+                Ok(service) => service,
+                Err(err) => {
+                    let message = err.to_string();
+                    let lowered = message.to_ascii_lowercase();
+                    if lowered.contains("permission denied") || lowered.contains("not permitted") {
+                        eprintln!(
                         "skipping shutdown_command_stops_dht_service: {message} (likely sandboxed)"
                     );
-                    return;
+                        return;
+                    }
+                    panic!("start service: {message}");
                 }
-                panic!("start service: {message}");
-            }
-        };
+            };
         service.run().await;
 
         service.shutdown().await.expect("shutdown");
@@ -1166,6 +1573,7 @@ mod tests {
 
         let snapshot = service.metrics_snapshot().await;
         assert_eq!(snapshot.peer_count, 0);
+        assert_eq!(snapshot.reachability, NatReachabilityState::Unknown);
     }
 
     #[test]
@@ -1185,5 +1593,7 @@ mod tests {
         assert!(snapshot
             .listen_addrs
             .contains(&"/ip4/0.0.0.0/tcp/4001".to_string()));
+        assert!(snapshot.observed_addrs.is_empty());
+        assert!(snapshot.reachability_history.is_empty());
     }
 }

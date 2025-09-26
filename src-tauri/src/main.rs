@@ -34,7 +34,7 @@ use std::process::Command;
 use std::{
     io::{BufRead, BufReader},
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Components, System, MINIMUM_CPU_UPDATE_INTERVAL};
 use systemstat::{Platform, System as SystemStat};
@@ -43,11 +43,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State,
 };
-use tokio::{
-    sync::Mutex,
-    task::JoinHandle,
-    time::{sleep, Duration},
-};
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{info, warn};
 
@@ -342,6 +338,9 @@ async fn start_dht_node(
     state: State<'_, AppState>,
     port: u16,
     bootstrap_nodes: Vec<String>,
+    enable_autonat: Option<bool>,
+    autonat_probe_interval_secs: Option<u64>,
+    autonat_servers: Option<Vec<String>>,
 ) -> Result<String, String> {
     {
         let dht_guard = state.dht.lock().await;
@@ -350,9 +349,21 @@ async fn start_dht_node(
         }
     }
 
-    let dht_service = DhtService::new(port, bootstrap_nodes, None, false)
-        .await
-        .map_err(|e| format!("Failed to start DHT: {}", e))?;
+    let auto_enabled = enable_autonat.unwrap_or(true);
+    let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
+    let autonat_server_list = autonat_servers.unwrap_or_default();
+
+    let dht_service = DhtService::new(
+        port,
+        bootstrap_nodes,
+        None,
+        false,
+        auto_enabled,
+        probe_interval,
+        autonat_server_list,
+    )
+    .await
+    .map_err(|e| format!("Failed to start DHT: {}", e))?;
 
     let peer_id = dht_service.get_peer_id().await;
 
@@ -433,6 +444,20 @@ async fn start_dht_node(
                             proxies.push(new_node.clone());
                             let _ = app_handle.emit("proxy_status_update", new_node);
                         }
+                    }
+                    DhtEvent::NatStatus {
+                        state,
+                        confidence,
+                        last_error,
+                        summary,
+                    } => {
+                        let payload = serde_json::json!({
+                            "state": state,
+                            "confidence": confidence,
+                            "lastError": last_error,
+                            "summary": summary,
+                        });
+                        let _ = app_handle.emit("nat_status_update", payload);
                     }
                     DhtEvent::EchoReceived { from, utf8, bytes } => {
                         // Sending inbox event to frontend
@@ -641,6 +666,20 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                         }
                     )
                 }
+                DhtEvent::NatStatus {
+                    state,
+                    confidence,
+                    last_error,
+                    summary,
+                } => match serde_json::to_string(&serde_json::json!({
+                    "state": state,
+                    "confidence": confidence,
+                    "lastError": last_error,
+                    "summary": summary,
+                })) {
+                    Ok(json) => format!("nat_status:{json}"),
+                    Err(_) => "nat_status:{}".to_string(),
+                },
                 DhtEvent::PeerRtt { peer, rtt_ms } => format!("peer_rtt:{peer}:{rtt_ms}"),
                 DhtEvent::EchoReceived { from, utf8, bytes } => format!(
                     "echo_received:{}:{}:{}",

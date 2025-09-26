@@ -537,7 +537,10 @@ mod tests {
 
         let written = tokio::fs::read(&output_path).await.expect("file read");
         assert_eq!(written, b"hello world");
-        assert_eq!(FileTransferService::last_attempts(), 3);
+        let metrics_snapshot = metrics.lock().await.snapshot();
+        assert_eq!(metrics_snapshot.total_success, 1);
+        assert_eq!(metrics_snapshot.total_retries, 2);
+        assert_eq!(metrics_snapshot.recent_attempts.len(), 3);
 
         // Ensure we received attempt events
         let mut statuses = Vec::new();
