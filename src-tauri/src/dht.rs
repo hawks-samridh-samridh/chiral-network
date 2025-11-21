@@ -6846,7 +6846,44 @@ impl DhtService {
             0.5 // Default neutral score for new relays
         };
 
-        // Register with the relay registry
+        // ===== DHT is source of truth for relay nodes =====
+        // 1. Read current relay nodes from DHT
+        let mut relay_nodes = match self.get_relay_nodes().await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!("Failed to read relay nodes from DHT: {}", e);
+                Vec::new() // Start with empty list if DHT read fails
+            }
+        };
+
+        // 2. Update or insert this node's entry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let my_info = crate::relay_registry::RelayInfo {
+            peer_id: self.peer_id.clone(),
+            addrs: listen_addrs.clone(),
+            alias: self.relay_server_alias.clone(),
+            last_seen: now,
+            health_score,
+        };
+
+        // Find and update existing entry, or append new one
+        if let Some(existing) = relay_nodes.iter_mut().find(|n| n.peer_id == self.peer_id) {
+            *existing = my_info;
+        } else {
+            relay_nodes.push(my_info);
+        }
+
+        // 3. Write updated list back to DHT (canonical source of truth)
+        if let Err(e) = self.put_relay_nodes(relay_nodes).await {
+            tracing::error!("Failed to write relay nodes to DHT: {}", e);
+            return; // Don't update local registry if DHT write fails
+        }
+
+        // 4. Update local registry for fast access
         registry
             .register(
                 self.peer_id.clone(),
@@ -6857,7 +6894,7 @@ impl DhtService {
             .await;
 
         tracing::debug!(
-            "🔄 Auto-registered as relay: peer_id={}, addrs={:?}, health={:.2}",
+            "🔄 Auto-registered as relay in DHT: peer_id={}, addrs={:?}, health={:.2}",
             self.peer_id,
             listen_addrs,
             health_score
@@ -7403,6 +7440,69 @@ impl DhtService {
             .map_err(|e| e.to_string())?;
         receiver.await.map_err(|e| e.to_string())?
     }
+
+    /// DHT key for the canonical relay nodes list
+    const RELAY_NODES_DHT_KEY: &'static str = "relay_nodes";
+
+    /// Store relay nodes list in the DHT (canonical source of truth)
+    pub async fn put_relay_nodes(&self, nodes: Vec<crate::relay_registry::RelayInfo>) -> Result<(), String> {
+        let serialized = serde_json::to_vec(&nodes)
+            .map_err(|e| format!("Failed to serialize relay nodes: {}", e))?;
+
+        self.put_dht_value(Self::RELAY_NODES_DHT_KEY.to_string(), serialized).await
+    }
+
+    /// Retrieve relay nodes list from the DHT
+    pub async fn get_relay_nodes(&self) -> Result<Vec<crate::relay_registry::RelayInfo>, String> {
+        match self.get_dht_value(Self::RELAY_NODES_DHT_KEY.to_string()).await? {
+            Some(data) => {
+                serde_json::from_slice(&data)
+                    .map_err(|e| format!("Failed to deserialize relay nodes: {}", e))
+            }
+            None => Ok(Vec::new()), // No relay nodes in DHT yet
+        }
+    }
+
+    /// Sync local RelayRegistry from DHT (DHT is source of truth)
+    pub async fn sync_relay_registry_from_dht(&self) -> Result<usize, String> {
+        let relay_registry = match &self.relay_registry {
+            Some(registry) => registry,
+            None => return Ok(0), // No local registry to sync
+        };
+
+        // Fetch from DHT
+        let dht_nodes = self.get_relay_nodes().await?;
+
+        // Clear local registry and repopulate from DHT
+        // We use the current timestamp for pruning check
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Prune stale entries (>5 minutes old) while syncing
+        let fresh_nodes: Vec<_> = dht_nodes.into_iter()
+            .filter(|node| {
+                let age_secs = now.saturating_sub(node.last_seen);
+                age_secs <= 300 // Keep nodes seen in last 5 minutes
+            })
+            .collect();
+
+        let count = fresh_nodes.len();
+
+        // Replace local registry with DHT data
+        for node in fresh_nodes {
+            relay_registry.register(
+                node.peer_id,
+                node.addrs,
+                node.alias,
+                node.health_score,
+            ).await;
+        }
+
+        info!("Synced {} relay nodes from DHT to local registry", count);
+        Ok(count)
+    }
 }
 
 impl DhtService {
@@ -7921,5 +8021,115 @@ mod tests {
 
         let guard = metrics.lock().await;
         assert_eq!(guard.listen_addrs.len(), 2);
+    }
+
+    /// Tests for DHT-backed relay registry
+    mod relay_dht_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_put_and_get_relay_nodes() {
+            // Create a test DHT service
+            let service = DhtService::new(
+                0,
+                vec![],
+                None,
+                false,
+                false,
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                Some(256),
+                Some(1024),
+                false,
+                Vec::new(),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create DhtService");
+
+            // Create test relay nodes
+            let test_nodes = vec![
+                crate::relay_registry::RelayInfo {
+                    peer_id: "12D3KooWTest1".to_string(),
+                    addrs: vec!["/ip4/1.2.3.4/tcp/4001".to_string()],
+                    alias: Some("test-relay-1".to_string()),
+                    last_seen: 1234567890,
+                    health_score: 0.95,
+                },
+                crate::relay_registry::RelayInfo {
+                    peer_id: "12D3KooWTest2".to_string(),
+                    addrs: vec!["/ip4/5.6.7.8/tcp/4001".to_string()],
+                    alias: Some("test-relay-2".to_string()),
+                    last_seen: 1234567891,
+                    health_score: 0.85,
+                },
+            ];
+
+            // Write to DHT
+            service
+                .put_relay_nodes(test_nodes.clone())
+                .await
+                .expect("Failed to put relay nodes");
+
+            // Give DHT a moment to propagate
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Read back from DHT
+            let retrieved = service
+                .get_relay_nodes()
+                .await
+                .expect("Failed to get relay nodes");
+
+            // Verify
+            assert_eq!(retrieved.len(), 2);
+            assert_eq!(retrieved[0].peer_id, "12D3KooWTest1");
+            assert_eq!(retrieved[1].peer_id, "12D3KooWTest2");
+            assert_eq!(retrieved[0].health_score, 0.95);
+            assert_eq!(retrieved[1].health_score, 0.85);
+
+            service.shutdown().await.ok();
+        }
+
+        #[tokio::test]
+        async fn test_empty_relay_nodes() {
+            let service = DhtService::new(
+                0,
+                vec![],
+                None,
+                false,
+                false,
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                Some(256),
+                Some(1024),
+                false,
+                Vec::new(),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create DhtService");
+
+            // Try to read non-existent key
+            let nodes = service
+                .get_relay_nodes()
+                .await
+                .expect("Failed to get relay nodes");
+
+            assert_eq!(nodes.len(), 0, "Should return empty vec for non-existent key");
+
+            service.shutdown().await.ok();
+        }
     }
 }

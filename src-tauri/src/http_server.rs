@@ -402,24 +402,28 @@ async fn health_check() -> impl IntoResponse {
 ///
 /// Returns the list of active relay nodes in the network
 ///
-/// This endpoint is queried by peers to discover available relay nodes.
-/// The bootstrap server (typically running on IS_BOOTSTRAP=1 node) maintains
-/// this registry and makes it available to the network.
+/// This endpoint syncs from the DHT (canonical source of truth) before serving,
+/// ensuring clients always get the latest relay information.
+/// The local RelayRegistry serves as a fast cache/view over the DHT data.
 async fn get_relay_registry(State(state): State<Arc<HttpServerState>>) -> Response {
-    tracing::debug!("📋 Relay registry request");
+    tracing::debug!("📋 Relay registry request - syncing from DHT");
 
-    // Prune stale entries before returning (max age: 5 minutes = 300 seconds)
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let pruned = state.relay_registry.prune_stale(now, 300).await;
-    if pruned > 0 {
-        tracing::debug!("🗑️ Pruned {} stale relay entries before serving", pruned);
+    // First, sync from DHT (source of truth)
+    if let Some(dht) = state.dht.lock().await.as_ref() {
+        match dht.sync_relay_registry_from_dht().await {
+            Ok(count) => {
+                tracing::debug!("✅ Synced {} relay nodes from DHT", count);
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ Failed to sync relay registry from DHT: {}", e);
+                // Continue anyway - serve stale data rather than fail
+            }
+        }
+    } else {
+        tracing::debug!("⚠️ No DHT service available for sync - serving local cache");
     }
 
-    // Get all relays (sorted by health score)
+    // Get all relays from local registry (sorted by health score)
     let relays = state.relay_registry.list().await;
 
     tracing::info!(
