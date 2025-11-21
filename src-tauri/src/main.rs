@@ -34,6 +34,7 @@ pub mod geth_bootstrap;
 pub mod headless;
 pub mod http_download;
 pub mod http_server;
+pub mod relay_registry;
 pub mod keystore;
 pub mod manager;
 pub mod multi_source_download;
@@ -50,7 +51,7 @@ use crate::commands::auth::{
     validate_proxy_auth_token,
 };
 
-use crate::commands::bootstrap::get_bootstrap_nodes_command;
+use crate::commands::bootstrap::{get_bootstrap_nodes_command, get_bootstrap_nodes_with_info_command};
 use crate::commands::proxy::{
     disable_privacy_routing, enable_privacy_routing, list_proxies, proxy_connect, proxy_disconnect,
     proxy_echo, proxy_remove, ProxyNode,
@@ -1161,6 +1162,7 @@ async fn start_dht_node(
     enable_autorelay: Option<bool>,
     preferred_relays: Option<Vec<String>>,
     enable_relay_server: Option<bool>,
+    relay_server_alias: Option<String>,
 ) -> Result<String, String> {
     {
         let dht_guard = state.dht.lock().await;
@@ -1224,6 +1226,9 @@ async fn start_dht_node(
     let blockstore_db_path = proj_dirs.data_dir().join("blockstore_db");
     let async_blockstore_path = async_std::path::Path::new(blockstore_db_path.as_os_str());
 
+    // Get relay registry from HTTP server state
+    let relay_registry = Some(state.http_server_state.relay_registry.clone());
+
     let dht_service = DhtService::new(
         port,
         bootstrap_nodes,
@@ -1239,8 +1244,10 @@ async fn start_dht_node(
         cache_size_mb,
         /* enable AutoRelay (disabled by default) */ final_enable_autorelay,
         preferred_relays.unwrap_or_default(),
-        is_bootstrap.unwrap_or(false), // enable_relay_server only on bootstrap
+        enable_relay_server.unwrap_or(is_bootstrap.unwrap_or(false)), // enable_relay_server from settings or fallback to is_bootstrap
         Some(&async_blockstore_path),
+        relay_registry,
+        relay_server_alias,
     )
     .await
     .map_err(|e| format!("Failed to start DHT: {}", e))?;
@@ -5664,13 +5671,16 @@ fn main() {
             proxy_auth_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
 
             // Initialize HTTP server state (uses same storage as FileTransferService)
-            http_server_state: Arc::new(http_server::HttpServerState::new({
-                // Use same storage directory as FileTransferService (files/, not chunks/)
-                use directories::ProjectDirs;
-                ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| dirs.data_dir().join("files"))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("files"))
-            })),
+            http_server_state: Arc::new(http_server::HttpServerState::new(
+                {
+                    // Use same storage directory as FileTransferService (files/, not chunks/)
+                    use directories::ProjectDirs;
+                    ProjectDirs::from("com", "chiral-network", "chiral-network")
+                        .map(|dirs| dirs.data_dir().join("files"))
+                        .unwrap_or_else(|| std::env::current_dir().unwrap().join("files"))
+                },
+                Arc::new(relay_registry::RelayRegistry::new()),
+            )),
             http_server_addr: Arc::new(Mutex::new(None)),
 
             // Initialize stream authentication
@@ -5807,6 +5817,7 @@ fn main() {
             enable_privacy_routing,
             disable_privacy_routing,
             get_bootstrap_nodes_command,
+            get_bootstrap_nodes_with_info_command,
             generate_totp_secret,
             is_2fa_enabled,
             verify_and_enable_totp,

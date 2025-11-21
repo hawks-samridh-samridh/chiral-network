@@ -36,5 +36,8 @@ pub mod stream_auth;
 // Reputation system
 pub mod reputation;
 
+// Relay registry for tracking active relay nodes
+pub mod relay_registry;
+
 // Logger module for file-based logging
 pub mod logger;

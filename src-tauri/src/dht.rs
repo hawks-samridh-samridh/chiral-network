@@ -5459,6 +5459,12 @@ pub struct DhtService {
     file_heartbeat_state: Arc<Mutex<HashMap<String, FileHeartbeatState>>>,
     seeder_heartbeats_cache: Arc<Mutex<HashMap<String, FileHeartbeatCacheEntry>>>,
     pending_heartbeat_updates: Arc<Mutex<HashSet<String>>>,
+
+    // Relay registry for auto-registration (optional, only used on relay servers)
+    relay_registry: Option<Arc<crate::relay_registry::RelayRegistry>>,
+    enable_relay_server: bool,
+    relay_server_alias: Option<String>,
+    last_relay_registration: Arc<Mutex<Option<Instant>>>,
 }
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
@@ -5679,6 +5685,8 @@ impl DhtService {
         preferred_relays: Vec<String>,
         enable_relay_server: bool,
         blockstore_db_path: Option<&Path>,
+        relay_registry: Option<Arc<crate::relay_registry::RelayRegistry>>,
+        relay_server_alias: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         // ---- Hotfix: finalize AutoRelay flag (bootstrap OFF + ENV OFF)
         let mut final_enable_autorelay = enable_autorelay;
@@ -6181,6 +6189,12 @@ impl DhtService {
             file_heartbeat_state,
             seeder_heartbeats_cache,
             pending_heartbeat_updates,
+
+            // Relay registry for auto-registration
+            relay_registry,
+            enable_relay_server,
+            relay_server_alias,
+            last_relay_registration: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -6757,7 +6771,97 @@ impl DhtService {
     pub async fn metrics_snapshot(&self) -> DhtMetricsSnapshot {
         let metrics = self.metrics.lock().await.clone();
         let peer_count = self.connected_peers.lock().await.len();
+
+        // Attempt to register as relay if conditions are met
+        self.maybe_register_as_relay(&metrics).await;
+
         DhtMetricsSnapshot::from(metrics, peer_count)
+    }
+
+    /// Auto-register this node as a relay if conditions are met
+    ///
+    /// Registers at most once per 60 seconds when:
+    /// 1. enable_relay_server is true
+    /// 2. reachability is Public
+    /// 3. We have at least one non-private listen address
+    /// 4. relay_registry is available
+    async fn maybe_register_as_relay(&self, metrics: &DhtMetrics) {
+        // Check if we should register
+        if !self.enable_relay_server {
+            return;
+        }
+
+        let Some(ref registry) = self.relay_registry else {
+            return;
+        };
+
+        // Check reachability
+        if metrics.reachability_state != NatReachabilityState::Public {
+            return;
+        }
+
+        // Rate limiting: only register once per 60 seconds
+        let now = Instant::now();
+        {
+            let mut last_reg = self.last_relay_registration.lock().await;
+            if let Some(last_time) = *last_reg {
+                if now.duration_since(last_time) < Duration::from_secs(60) {
+                    return; // Too soon since last registration
+                }
+            }
+            *last_reg = Some(now);
+        }
+
+        // Get non-private listen addresses
+        let listen_addrs: Vec<String> = metrics
+            .listen_addrs
+            .iter()
+            .filter(|addr| {
+                // Filter out localhost and private IPs
+                !addr.contains("127.0.0.1")
+                    && !addr.contains("::1")
+                    && !addr.contains("0.0.0.0")
+                    && !addr.contains("192.168.")
+                    && !addr.contains("10.")
+                    && !addr.contains("/p2p-circuit") // Exclude relay circuits
+            })
+            .cloned()
+            .collect();
+
+        if listen_addrs.is_empty() {
+            tracing::debug!("🔄 Skipping relay registration: no public listen addresses");
+            return;
+        }
+
+        // Calculate health score from relay metrics
+        // Simple heuristic: ratio of successful reservations
+        let health_score = if metrics.reservation_renewals > 0 {
+            let total_attempts = metrics.reservation_renewals + metrics.reservation_evictions;
+            if total_attempts > 0 {
+                (metrics.reservation_renewals as f32) / (total_attempts as f32)
+            } else {
+                0.5 // Default neutral score
+            }
+        } else {
+            0.5 // Default neutral score for new relays
+        };
+
+        // Register with the relay registry
+        registry
+            .register(
+                self.peer_id.clone(),
+                listen_addrs.clone(),
+                self.relay_server_alias.clone(),
+                health_score,
+            )
+            .await;
+
+        tracing::debug!(
+            "🔄 Auto-registered as relay: peer_id={}, addrs={:?}, health={:.2}",
+            self.peer_id,
+            listen_addrs,
+            health_score
+        );
     }
 
     pub async fn store_block(&self, cid: Cid, data: Vec<u8>) -> Result<(), String> {
@@ -7742,6 +7846,8 @@ mod tests {
             Vec::new(), // preferred_relays
             false,      // enable_relay_server
             None,
+            None,       // relay_registry
+            None,       // relay_server_alias
         )
         .await
         {

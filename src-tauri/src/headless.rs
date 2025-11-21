@@ -88,6 +88,10 @@ pub struct CliArgs {
     /// Preferred relay nodes (multiaddr form, can be specified multiple times)
     #[arg(long)]
     pub relay: Vec<String>,
+
+    /// Relay server alias (friendly name for this relay server, shown in logs and registry)
+    #[arg(long)]
+    pub relay_server_alias: Option<String>,
 }
 
 pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -162,6 +166,15 @@ pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error
         info!("AutoRelay disabled");
     }
 
+    // Create relay registry (for bootstrap nodes that act as relay servers)
+    use crate::relay_registry::RelayRegistry;
+    use std::sync::Arc;
+    let relay_registry = if args.is_bootstrap {
+        Some(Arc::new(RelayRegistry::new()))
+    } else {
+        None
+    };
+
     // Start DHT node
     let dht_service = DhtService::new(
         args.dht_port,
@@ -180,6 +193,8 @@ pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error
         args.relay.clone(),
         args.is_bootstrap, // enable_relay_server on bootstrap
         None,
+        relay_registry,
+        args.relay_server_alias.clone(),
     )
     .await?;
     let peer_id = dht_service.get_peer_id().await;
