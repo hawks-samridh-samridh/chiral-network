@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    {
+      "alias": "vincenzo-bootstrap",
+      "multiaddr": "/ip4/134.199.240.145/tcp/4001/p2p/12D3KooWFYTuQ2FY8tXRtFKfpXkTSipTF55mZkLntwtN1nHu83qE"
+    },
+    {
+      "alias": "turtle-bootstrap-2",
+      "multiaddr": "/ip4/136.116.190.115/tcp/4001/p2p/12D3KooWETLNJUVLbkAbenbSPPdwN9ZLkBU3TLfyAeEUW2dsVptr"
+    },
+    {
+      "alias": "whale-bootstrap-3",
+      "multiaddr": "/ip4/130.245.173.105/tcp/4001/p2p/12D3KooWGFRvjXFBoU9y6xdteqP1kzctAXrYPoaDGmTGRHybZ6rp"
+    }
+  ]
+}
