@@ -1495,3 +1495,116 @@ describe("DhtService - multiaddr formatting", () => {
     expect(dhtService.getMultiaddr()).toBeNull();
   });
 });
+
+describe("DhtService - Bootstrap and Relay Registry", () => {
+  const mockInvoke = vi.mocked(invoke);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("getBootstrapNodesWithInfo", () => {
+    it("should fetch bootstrap nodes with full info", async () => {
+      const mockBootstrapNodes = [
+        { alias: "vincenzo-bootstrap", multiaddr: "/ip4/134.199.240.145/tcp/4001/p2p/12D3KooW..." },
+        { alias: "turtle-bootstrap-2", multiaddr: "/ip4/136.116.190.115/tcp/4001/p2p/12D3KooW..." },
+      ];
+
+      mockInvoke.mockResolvedValueOnce(mockBootstrapNodes);
+
+      const nodes = await dhtService.getBootstrapNodesWithInfo();
+
+      expect(mockInvoke).toHaveBeenCalledWith("get_bootstrap_nodes_with_info_command");
+      expect(nodes).toEqual(mockBootstrapNodes);
+      expect(nodes).toHaveLength(2);
+      expect(nodes[0].alias).toBe("vincenzo-bootstrap");
+    });
+
+    it("should return empty array on error", async () => {
+      mockInvoke.mockRejectedValueOnce(new Error("Failed to load"));
+
+      const nodes = await dhtService.getBootstrapNodesWithInfo();
+
+      expect(nodes).toEqual([]);
+    });
+  });
+
+  describe("getRelayRegistry", () => {
+    beforeEach(() => {
+      global.fetch = vi.fn();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("should fetch relay registry from bootstrap server", async () => {
+      const mockRelays = [
+        {
+          peerId: "12D3KooWRelay1",
+          addrs: ["/ip4/1.2.3.4/tcp/4001"],
+          alias: "relay-1",
+          lastSeen: Date.now() / 1000,
+          healthScore: 0.9,
+        },
+        {
+          peerId: "12D3KooWRelay2",
+          addrs: ["/ip4/5.6.7.8/tcp/4001"],
+          alias: null,
+          lastSeen: Date.now() / 1000,
+          healthScore: 0.75,
+        },
+      ];
+
+      (global.fetch as any).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockRelays,
+      });
+
+      const relays = await dhtService.getRelayRegistry("http://134.199.240.145:8545");
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        "http://134.199.240.145:8545/api/relay/registry",
+        expect.objectContaining({
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      expect(relays).toEqual(mockRelays);
+      expect(relays).toHaveLength(2);
+      expect(relays[0].alias).toBe("relay-1");
+      expect(relays[1].alias).toBeNull();
+    });
+
+    it("should return empty array on HTTP error", async () => {
+      (global.fetch as any).mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+      });
+
+      const relays = await dhtService.getRelayRegistry("http://134.199.240.145:8545");
+
+      expect(relays).toEqual([]);
+    });
+
+    it("should return empty array on network error", async () => {
+      (global.fetch as any).mockRejectedValueOnce(new Error("Network error"));
+
+      const relays = await dhtService.getRelayRegistry("http://134.199.240.145:8545");
+
+      expect(relays).toEqual([]);
+    });
+
+    it("should handle empty relay registry", async () => {
+      (global.fetch as any).mockResolvedValueOnce({
+        ok: true,
+        json: async () => [],
+      });
+
+      const relays = await dhtService.getRelayRegistry("http://134.199.240.145:8545");
+
+      expect(relays).toEqual([]);
+    });
+  });
+});

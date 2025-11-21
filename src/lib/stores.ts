@@ -556,6 +556,7 @@ export interface AppSettings {
   maxLogSizeMB: number; // Maximum size of a single log file in MB
   pricePerMb: number; // Price per MB in Chiral (e.g., 0.001)
   customBootstrapNodes: string[]; // Custom bootstrap nodes for DHT (leave empty to use defaults)
+  bootstrapHttpUrl: string; // HTTP URL for bootstrap server (defaults to first bootstrap node IP on port 8545)
   autoStartDHT: boolean; // Whether to automatically start DHT on app launch
   selectedProtocol: "WebRTC" | "Bitswap" | "BitTorrent" | null; // Protocol selected for file uploads
 }
@@ -609,6 +610,7 @@ export const settings = writable<AppSettings>({
   maxLogSizeMB: 10, // 10 MB per log file by default
   pricePerMb: 0.001, // Default price: 0.001, until ability to set pricePerMb is there, then change to 0.001 Chiral per MB
   customBootstrapNodes: [], // Empty by default - use hardcoded bootstrap nodes
+  bootstrapHttpUrl: "http://134.199.240.145:8545", // Default to first bootstrap node on port 8545
   autoStartDHT: false, // Don't auto-start DHT by default
   selectedProtocol: "Bitswap" as "WebRTC" | "Bitswap" | "BitTorrent", // Default to Bitswap
 });

@@ -15,9 +15,9 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
   import { dhtService } from '$lib/dht'
+  import type { DhtHealth, NatConfidence, NatReachabilityState, RelayInfo, BootstrapNode } from '$lib/dht'
   import { getStatus as fetchGethStatus, type GethStatus } from '$lib/services/gethService'
   import { resetConnectionAttempts } from '$lib/dhtHelpers'
-  import type { DhtHealth, NatConfidence, NatReachabilityState } from '$lib/dht'
   import { Clipboard } from "lucide-svelte"
   import { t } from 'svelte-i18n';
   import { showToast } from '$lib/toast';
@@ -107,6 +107,12 @@
   let lastNatState: NatReachabilityState | null = null
   let lastNatConfidence: NatConfidence | null = null
   let cancelConnection = false
+
+  // Bootstrap and Relay Registry
+  let bootstrapNodesWithInfo: BootstrapNode[] = []
+  let relayRegistry: RelayInfo[] = []
+  let relayRegistryLoading = false
+  let relayRegistryError: string | null = null
 
   // Always preserve connections - no unreliable time-based detection
   
@@ -304,6 +310,35 @@
       console.error('Failed to fetch bootstrap nodes:', error)
       dhtBootstrapNodes = []
       dhtBootstrapNode = 'Failed to load bootstrap nodes'
+    }
+  }
+
+  async function fetchBootstrapNodesWithInfo() {
+    try {
+      bootstrapNodesWithInfo = await dhtService.getBootstrapNodesWithInfo()
+      console.log('Bootstrap nodes with info:', bootstrapNodesWithInfo)
+    } catch (error) {
+      console.error('Failed to fetch bootstrap nodes with info:', error)
+      bootstrapNodesWithInfo = []
+    }
+  }
+
+  async function fetchRelayRegistry() {
+    try {
+      relayRegistryLoading = true
+      relayRegistryError = null
+
+      // Use bootstrapHttpUrl from settings, or derive from CHIRAL_BOOTSTRAP_HTTP_URL env
+      const httpUrl = $settings.bootstrapHttpUrl || 'http://134.199.240.145:8545'
+
+      relayRegistry = await dhtService.getRelayRegistry(httpUrl)
+      console.log('Relay registry:', relayRegistry)
+    } catch (error) {
+      console.error('Failed to fetch relay registry:', error)
+      relayRegistryError = error instanceof Error ? error.message : 'Failed to load'
+      relayRegistry = []
+    } finally {
+      relayRegistryLoading = false
     }
   }
   async function registerNatListener() {
@@ -1210,6 +1245,8 @@
         // Run ALL independent checks in parallel for better performance
         await Promise.all([
           fetchBootstrapNodes(),
+          fetchBootstrapNodesWithInfo(),
+          fetchRelayRegistry(),
           checkGethStatus(),
           syncDhtStatusOnPageLoad() // DHT check is independent from Geth check
         ])
@@ -1476,6 +1513,101 @@
   <!-- Geth Node Lifecycle & Bootstrap Health -->
   <GethStatusCard dataDir="./bin/geth-data" logLines={40} refreshIntervalMs={10000} />
 
+  <!-- Bootstrap and Relay Status Card -->
+  <Card class="p-6">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold">Bootstrap and Relay Status</h2>
+      <Button
+        variant="ghost"
+        size="sm"
+        on:click={() => {
+          fetchBootstrapNodesWithInfo();
+          fetchRelayRegistry();
+        }}
+      >
+        <RefreshCw class="w-4 h-4" />
+      </Button>
+    </div>
+
+    <div class="space-y-4">
+      <!-- Bootstrap Nodes Section -->
+      <div>
+        <h3 class="text-sm font-medium mb-2">Bootstrap Nodes ({bootstrapNodesWithInfo.length})</h3>
+        {#if bootstrapNodesWithInfo.length > 0}
+          <div class="space-y-2">
+            {#each bootstrapNodesWithInfo.slice(0, 3) as node}
+              <div class="flex items-center gap-2 text-sm p-2 rounded bg-gray-50 dark:bg-gray-800">
+                <Server class="w-4 h-4 text-blue-500" />
+                <div class="flex-1">
+                  <div class="font-medium">{node.alias}</div>
+                  <div class="text-xs text-gray-500 truncate">{node.multiaddr}</div>
+                </div>
+                <div class="h-2 w-2 bg-green-500 rounded-full" title="Active"></div>
+              </div>
+            {/each}
+            {#if bootstrapNodesWithInfo.length > 3}
+              <div class="text-xs text-gray-500">
+                +{bootstrapNodesWithInfo.length - 3} more bootstrap nodes
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <div class="text-sm text-gray-500">No bootstrap nodes configured</div>
+        {/if}
+      </div>
+
+      <!-- Relay Registry Section -->
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-medium">Relay Registry</h3>
+          {#if relayRegistryLoading}
+            <div class="text-xs text-gray-500">Loading...</div>
+          {:else if relayRegistryError}
+            <div class="text-xs text-red-500">{relayRegistryError}</div>
+          {:else}
+            <div class="flex items-center gap-2">
+              {#if relayRegistry.length > 0}
+                <div class="h-2 w-2 bg-green-500 rounded-full animate-pulse"></div>
+                <span class="text-xs text-green-600">{relayRegistry.length} active relays</span>
+              {:else}
+                <div class="h-2 w-2 bg-yellow-500 rounded-full"></div>
+                <span class="text-xs text-yellow-600">No active relays</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
+        {#if relayRegistry.length > 0}
+          <div class="space-y-2">
+            {#each relayRegistry.slice(0, 3) as relay}
+              <div class="flex items-center gap-2 text-sm p-2 rounded bg-gray-50 dark:bg-gray-800">
+                <Signal class="w-4 h-4 text-purple-500" />
+                <div class="flex-1">
+                  <div class="flex items-center gap-2">
+                    {#if relay.alias}
+                      <span class="font-medium">{relay.alias}</span>
+                    {/if}
+                    <span class="text-xs text-gray-500">(health: {(relay.healthScore * 100).toFixed(0)}%)</span>
+                  </div>
+                  <div class="text-xs text-gray-500 truncate">{relay.peerId.substring(0, 16)}...</div>
+                  {#if relay.addrs.length > 0}
+                    <div class="text-xs text-gray-400 truncate">{relay.addrs[0]}</div>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+            {#if relayRegistry.length > 3}
+              <div class="text-xs text-gray-500">
+                +{relayRegistry.length - 3} more relays
+              </div>
+            {/if}
+          </div>
+        {:else if !relayRegistryLoading && !relayRegistryError}
+          <div class="text-sm text-gray-500">No active relays in the network</div>
+        {/if}
+      </div>
+    </div>
+  </Card>
 
   <!-- DHT Network Status Card -->
   <Card class="p-6">

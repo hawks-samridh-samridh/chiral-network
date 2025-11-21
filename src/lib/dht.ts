@@ -128,6 +128,19 @@ export interface DhtHealth {
   lastDcutrFailure: number | null;
 }
 
+export interface RelayInfo {
+  peerId: string;
+  addrs: string[];
+  alias: string | null;
+  lastSeen: number;
+  healthScore: number;
+}
+
+export interface BootstrapNode {
+  alias: string;
+  multiaddr: string;
+}
+
 export class DhtService {
   private static instance: DhtService | null = null;
   private peerId: string | null = null;
@@ -563,6 +576,49 @@ export class DhtService {
     } catch (error) {
       console.error("Failed to search file metadata:", error);
       throw error;
+    }
+  }
+
+  /**
+   * Get bootstrap nodes with full info (alias + multiaddr)
+   */
+  async getBootstrapNodesWithInfo(): Promise<BootstrapNode[]> {
+    try {
+      const nodes = await invoke<BootstrapNode[]>("get_bootstrap_nodes_with_info_command");
+      return nodes;
+    } catch (error) {
+      console.error("Failed to get bootstrap nodes with info:", error);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch relay registry from the bootstrap server
+   *
+   * @param bootstrapHttpUrl - HTTP URL of the bootstrap server (e.g., http://134.199.240.145:8545)
+   * @returns List of active relay nodes
+   */
+  async getRelayRegistry(bootstrapHttpUrl: string): Promise<RelayInfo[]> {
+    try {
+      const url = `${bootstrapHttpUrl}/api/relay/registry`;
+      console.log("Fetching relay registry from:", url);
+
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const relays = await response.json();
+      return relays;
+    } catch (error) {
+      console.error("Failed to fetch relay registry:", error);
+      return [];
     }
   }
 }
