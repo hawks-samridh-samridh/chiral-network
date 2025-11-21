@@ -10,11 +10,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 
 // Import DhtService for metrics tracking
 use crate::dht::DhtService;
+use crate::relay_registry::RelayRegistry;
 
 /// HTTP Server for serving files via Range requests
 ///
@@ -48,9 +50,12 @@ pub struct HttpServerState {
     /// Maps file_hash → HttpFileMetadata
     /// Tracks which files are available for HTTP download
     pub files: Arc<RwLock<HashMap<String, HttpFileMetadata>>>,
-    
+
     /// DHT service for recording provider-side metrics
     pub dht: Arc<Mutex<Option<Arc<DhtService>>>>,
+
+    /// Relay registry for tracking active relay nodes in the network
+    pub relay_registry: Arc<RelayRegistry>,
 }
 
 impl HttpServerState {
@@ -58,11 +63,16 @@ impl HttpServerState {
     ///
     /// The storage_dir should point to the FileTransferService storage directory
     /// (e.g., ~/.local/share/chiral-network/files/)
-    pub fn new(storage_dir: PathBuf) -> Self {
+    ///
+    /// # Arguments
+    /// * `storage_dir` - Path to file storage directory
+    /// * `relay_registry` - Shared relay registry instance
+    pub fn new(storage_dir: PathBuf, relay_registry: Arc<RelayRegistry>) -> Self {
         Self {
             storage_dir,
             files: Arc::new(RwLock::new(HashMap::new())),
             dht: Arc::new(Mutex::new(None)),
+            relay_registry,
         }
     }
     
@@ -388,6 +398,38 @@ async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// GET /api/relay/registry
+///
+/// Returns the list of active relay nodes in the network
+///
+/// This endpoint is queried by peers to discover available relay nodes.
+/// The bootstrap server (typically running on IS_BOOTSTRAP=1 node) maintains
+/// this registry and makes it available to the network.
+async fn get_relay_registry(State(state): State<Arc<HttpServerState>>) -> Response {
+    tracing::debug!("📋 Relay registry request");
+
+    // Prune stale entries before returning (max age: 5 minutes = 300 seconds)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let pruned = state.relay_registry.prune_stale(now, 300).await;
+    if pruned > 0 {
+        tracing::debug!("🗑️ Pruned {} stale relay entries before serving", pruned);
+    }
+
+    // Get all relays (sorted by health score)
+    let relays = state.relay_registry.list().await;
+
+    tracing::info!(
+        "✅ Serving relay registry: {} active relays",
+        relays.len()
+    );
+
+    (StatusCode::OK, Json(relays)).into_response()
+}
+
 // ============================================================================
 // Server Setup
 // ============================================================================
@@ -398,6 +440,7 @@ pub fn create_router(state: Arc<HttpServerState>) -> Router {
         .route("/health", get(health_check))
         .route("/files/:file_hash", get(serve_file))
         .route("/files/:file_hash/metadata", get(serve_metadata))
+        .route("/api/relay/registry", get(get_relay_registry))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -438,7 +481,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let state = Arc::new(HttpServerState::new(PathBuf::from("/tmp/test_files")));
+        let relay_registry = Arc::new(RelayRegistry::new());
+        let state = Arc::new(HttpServerState::new(
+            PathBuf::from("/tmp/test_files"),
+            relay_registry,
+        ));
         let app = create_router(state);
 
         let response = app
