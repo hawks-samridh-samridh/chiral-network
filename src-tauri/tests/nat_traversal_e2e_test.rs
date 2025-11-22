@@ -61,7 +61,9 @@ async fn test_autonat_detection() {
         false,                        // enable_autorelay
         Vec::new(),                   // preferred_relays
         false,                        // enable_relay_server
-        None,                         // blockstore_db_path
+        None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await;
 
@@ -110,6 +112,8 @@ async fn test_dht_peer_discovery() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service1");
@@ -150,6 +154,8 @@ async fn test_dht_peer_discovery() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service2");
@@ -202,6 +208,8 @@ async fn test_file_publish_and_search() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service1");
@@ -234,6 +242,8 @@ async fn test_file_publish_and_search() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service2");
@@ -292,6 +302,8 @@ async fn test_dcutr_enabled() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service");
@@ -345,6 +357,8 @@ async fn test_multiple_autonat_servers() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service");
@@ -381,6 +395,8 @@ async fn test_reachability_history_tracking() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service");
@@ -426,6 +442,8 @@ async fn test_connection_metrics_tracking() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service1");
@@ -458,6 +476,8 @@ async fn test_connection_metrics_tracking() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create service2");
@@ -510,6 +530,8 @@ async fn test_nat_resilience_private_to_public() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create public peer");
@@ -551,6 +573,8 @@ async fn test_nat_resilience_private_to_public() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await
     .expect("Failed to create private peer");
@@ -614,6 +638,8 @@ async fn test_nat_resilience_connection_fallback() {
         Vec::new(), // preferred_relays
         false,      // enable_relay_server
         None,       // blockstore_db_path
+        None,       // relay_registry
+        None,       // relay_server_alias
     )
     .await;
 

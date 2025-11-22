@@ -7445,9 +7445,14 @@ impl DhtService {
     ///
     /// This follows the same pattern as libp2p protocol naming (e.g., "/ipfs/kad/1.0.0").
     ///
-    /// TODO: Consider replacing this custom DHT key with libp2p rendezvous or AutoRelay
-    /// once we adopt that behaviour in Chiral. This follows the same idea as libp2p
-    /// rendezvous/AutoRelay style discovery but uses a simple DHT record for now.
+    /// **Design Decision**: We use Kademlia DHT for relay discovery because:
+    /// 1. rust-libp2p does NOT have an official AutoRelay implementation (unlike go-libp2p)
+    /// 2. Kademlia DHT provides fully decentralized storage - any node can read/write
+    /// 3. Alternative (rendezvous) requires designated rendezvous servers (more centralized)
+    /// 4. This matches the pattern used by the rust-libp2p community for relay discovery
+    ///
+    /// The DHT serves as the canonical source of truth. RelayRegistry is a local cache/view
+    /// over this distributed data for fast access without DHT queries on every request.
     const RELAY_NODES_DHT_KEY: &'static str = "/chiral/relay-nodes/1.0.0";
 
     /// Store relay nodes list in the DHT (canonical source of truth)
