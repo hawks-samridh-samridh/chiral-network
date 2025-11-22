@@ -7441,8 +7441,14 @@ impl DhtService {
         receiver.await.map_err(|e| e.to_string())?
     }
 
-    /// DHT key for the canonical relay nodes list
-    const RELAY_NODES_DHT_KEY: &'static str = "relay_nodes";
+    /// DHT key for the canonical relay nodes list (libp2p-style namespace)
+    ///
+    /// This follows the same pattern as libp2p protocol naming (e.g., "/ipfs/kad/1.0.0").
+    ///
+    /// TODO: Consider replacing this custom DHT key with libp2p rendezvous or AutoRelay
+    /// once we adopt that behaviour in Chiral. This follows the same idea as libp2p
+    /// rendezvous/AutoRelay style discovery but uses a simple DHT record for now.
+    const RELAY_NODES_DHT_KEY: &'static str = "/chiral/relay-nodes/1.0.0";
 
     /// Store relay nodes list in the DHT (canonical source of truth)
     pub async fn put_relay_nodes(&self, nodes: Vec<crate::relay_registry::RelayInfo>) -> Result<(), String> {
